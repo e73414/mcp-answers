@@ -78,7 +78,7 @@ When you have a final answer or a clarifying question, respond in Markdown witho
 
   // Use admin-configured system prompt if set, otherwise fall back to built-in default
   const systemPrompt = customSystemPrompt
-    ? `${customSystemPrompt}\n\nThe user you are serving has email: ${email}.\n${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}\nRespond in Markdown. Use **bold** for key figures, lists for multiple items, and tables for tabular data.`
+    ? `${customSystemPrompt}\n\nThe user you are serving has email: ${email}.\n${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}`
     : defaultSystemPrompt;
 
   const priorMessages = Array.isArray(conversationHistory) ? conversationHistory : [];
