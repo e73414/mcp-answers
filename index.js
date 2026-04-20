@@ -90,6 +90,7 @@ app.post('/query', async (req, res) => {
     columns: result.columns,
     conversationId,
     model: result.model || null,
+    queriedDatasets: result.queriedDatasets || [],
   });
 });
 
