@@ -43,4 +43,21 @@ async function fetchMcpAnswersSystemPrompt() {
   return prompt || null;
 }
 
-module.exports = { fetchAnalyzeModel, fetchMcpAnswersTemperature, fetchMcpAnswersSystemPrompt };
+async function fetchUserPrompt(email) {
+  const url = (process.env.MCP_N8N_URL || 'http://mcp-n8n:3000').replace(/\/$/, '');
+  const secret = process.env.API_SECRET || '';
+  try {
+    const res = await axios.get(`${url}/user-prompt`, {
+      params: { email },
+      headers: { 'x-api-secret': secret },
+      timeout: 5000,
+    });
+    const prompt = (res.data?.user_prompt || '').trim();
+    return prompt || null;
+  } catch (err) {
+    console.warn('Could not fetch user prompt:', err.message);
+    return null;
+  }
+}
+
+module.exports = { fetchAnalyzeModel, fetchMcpAnswersTemperature, fetchMcpAnswersSystemPrompt, fetchUserPrompt };

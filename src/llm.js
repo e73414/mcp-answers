@@ -1,6 +1,6 @@
 'use strict';
 const axios = require('axios');
-const { fetchAnalyzeModel, fetchMcpAnswersTemperature, fetchMcpAnswersSystemPrompt } = require('./appSettings');
+const { fetchAnalyzeModel, fetchMcpAnswersTemperature, fetchMcpAnswersSystemPrompt, fetchUserPrompt } = require('./appSettings');
 
 const MAX_TOOL_ROUNDS = 8;
 
@@ -38,7 +38,12 @@ function extractViewsFromSql(sql) {
  * Returns { answer, sql, rows, columns, model, queriedDatasets } where sql/rows/columns may be null.
  */
 async function runAnalysis({ question, email, datasetId, conversationHistory, mcpClient, mcpTools }) {
-  const [model, temperature, customSystemPrompt] = await Promise.all([fetchAnalyzeModel(), fetchMcpAnswersTemperature(), fetchMcpAnswersSystemPrompt()]);
+  const [model, temperature, customSystemPrompt, userPrompt] = await Promise.all([
+    fetchAnalyzeModel(),
+    fetchMcpAnswersTemperature(),
+    fetchMcpAnswersSystemPrompt(),
+    fetchUserPrompt(email),
+  ]);
   const apiUrl = process.env.AI_ANALYZE_API_URL || 'https://api.fuelix.ai/v1';
   const apiKey = process.env.OPENROUTER_API_KEY || '';
 
@@ -52,8 +57,11 @@ async function runAnalysis({ question, email, datasetId, conversationHistory, mc
     },
   }));
 
+  const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+
   const defaultSystemPrompt = `You are a data analyst with access to tools to explore and query a PostgreSQL database.
 The user you are serving has email: ${email}.
+Today's date is ${today}. Use this when the user refers to relative dates such as "current month", "last week", "this year", etc.
 ${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}
 
 ## Required process
@@ -70,6 +78,8 @@ ${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all
 - If the question is ambiguous (time range, metric, grouping, or multiple interpretations), ask ONE specific clarifying question before querying. Do not guess.
 - If you found only partially relevant data, clearly state what you could determine from the data and what you could not.
 - Do not use phrases like "based on typical patterns" or "generally" — only report what the data shows.
+- ALWAYS use the exact column names returned by describe_table. If execute_query returns a "column does not exist" error, you used a wrong column name — this is NOT an access restriction. Call describe_table again to verify the exact names and retry.
+- NEVER tell the user there are "access restrictions on columns". Column-level restrictions do not exist in this system. A "column does not exist" error always means a wrong column name in your SQL.
 
 ## Confidence check before answering
 Before writing your final response, ask yourself: "Did I execute a query whose results directly and completely answer this question?" If yes, answer confidently. If no, either ask a clarifying question or state the limitation.
@@ -77,9 +87,13 @@ Before writing your final response, ask yourself: "Did I execute a query whose r
 When you have a final answer or a clarifying question, respond in Markdown without calling any more tools. Use **bold** for key figures, bullet lists or numbered lists for multiple items, and tables for tabular data.`;
 
   // Use admin-configured system prompt if set, otherwise fall back to built-in default
+  const userPromptSection = userPrompt
+    ? `\n\n## Personal context from the user\n${userPrompt}`
+    : '';
+
   const systemPrompt = customSystemPrompt
-    ? `${customSystemPrompt}\n\nThe user you are serving has email: ${email}.\n${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}`
-    : defaultSystemPrompt;
+    ? `${customSystemPrompt}\n\nThe user you are serving has email: ${email}.\nToday's date is ${today}. Use this when the user refers to relative dates such as "current month", "last week", "this year", etc.\n${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}${userPromptSection}`
+    : `${defaultSystemPrompt}${userPromptSection}`;
 
   const priorMessages = Array.isArray(conversationHistory) ? conversationHistory : [];
 
