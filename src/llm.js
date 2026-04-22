@@ -37,7 +37,7 @@ function extractViewsFromSql(sql) {
  * Runs the LLM tool-use loop using the MCP client session.
  * Returns { answer, sql, rows, columns, model, queriedDatasets } where sql/rows/columns may be null.
  */
-async function runAnalysis({ question, email, datasetId, conversationHistory, mcpClient, mcpTools }) {
+async function runAnalysis({ question, email, datasetId, conversationHistory, mcpClient, mcpTools, signal }) {
   const [model, temperature, customSystemPrompt, userPrompt] = await Promise.all([
     fetchAnalyzeModel(),
     fetchMcpAnswersTemperature(),
@@ -109,6 +109,7 @@ When you have a final answer or a clarifying question, respond in Markdown witho
   let viewToDataset = {}; // populated when list_tables is called
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    if (signal?.aborted) throw new Error('Cancelled');
     const response = await axios.post(
       `${apiUrl}/chat/completions`,
       {
@@ -124,6 +125,7 @@ When you have a final answer or a clarifying question, respond in Markdown witho
           'Content-Type': 'application/json',
         },
         timeout: 60000,
+        signal,
       }
     );
 
@@ -148,6 +150,7 @@ When you have a final answer or a clarifying question, respond in Markdown witho
 
     // Process tool calls
     for (const toolCall of assistantMsg.tool_calls) {
+      if (signal?.aborted) throw new Error('Cancelled');
       const toolName = toolCall.function.name;
       let toolArgs;
       try {
@@ -195,6 +198,7 @@ When you have a final answer or a clarifying question, respond in Markdown witho
   }
 
   // Exhausted rounds — ask for a final answer without tools
+  if (signal?.aborted) throw new Error('Cancelled');
   messages.push({ role: 'user', content: 'Please summarize what you found so far.' });
   const finalResp = await axios.post(
     `${apiUrl}/chat/completions`,
@@ -205,6 +209,7 @@ When you have a final answer or a clarifying question, respond in Markdown witho
         'Content-Type': 'application/json',
       },
       timeout: 30000,
+      signal,
     }
   );
   const queriedDatasets = lastSql

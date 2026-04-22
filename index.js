@@ -41,11 +41,17 @@ app.post('/query', async (req, res) => {
     return res.status(503).json({ error: 'MCP Postgres service unavailable' });
   }
 
+  const abortController = new AbortController();
+  req.on('close', () => abortController.abort());
+
   const startTime = Date.now();
   let result;
   try {
-    result = await runAnalysis({ question, email, datasetId: datasetId || null, conversationHistory: conversationHistory || [], mcpClient, mcpTools });
+    result = await runAnalysis({ question, email, datasetId: datasetId || null, conversationHistory: conversationHistory || [], mcpClient, mcpTools, signal: abortController.signal });
   } catch (err) {
+    if (abortController.signal.aborted || err.message === 'Cancelled' || err.code === 'ERR_CANCELED') {
+      return res.status(499).json({ error: 'Request cancelled' });
+    }
     console.error('LLM analysis error:', err.message);
     return res.status(500).json({ error: 'Analysis failed: ' + err.message });
   } finally {
