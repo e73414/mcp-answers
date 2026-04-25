@@ -101,7 +101,6 @@ async function callLlmStreaming({ apiUrl, apiKey, model, messages, tools, temper
 
   return {
     role: 'assistant',
-    // Discard any content leaked before tool_calls — APIs reject assistant messages with both
     content: hasToolCalls ? null : (content || null),
     tool_calls: toolCallsList,
   };
@@ -287,10 +286,10 @@ When you have a final answer or a clarifying question, respond in Markdown witho
 
         let toolResult;
         try {
-          // Return cached prefetch result to avoid duplicate MCP calls and context bloat
+          // Return short placeholder — full list already injected into system prompt, repeating it doubles context size
           if (toolName === 'list_tables' && prefetchedTableList) {
             console.log(`[timing] round ${round} list_tables served from cache`);
-            toolResult = prefetchedTableList;
+            toolResult = '(Dataset list already provided in system context above. Do not call list_tables again.)';
           } else {
             const mcpResult = await mcpClient.callTool({ name: toolName, arguments: toolArgs });
             const content = mcpResult.content?.[0];
