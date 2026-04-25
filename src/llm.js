@@ -1,6 +1,6 @@
 'use strict';
 const axios = require('axios');
-const { fetchAnalyzeModel, fetchMcpAnswersTemperature, fetchMcpAnswersSystemPrompt, fetchUserPrompt } = require('./appSettings');
+const { fetchAnalyzeModel, fetchMcpAnswersTemperature, fetchMcpAnswersSystemPrompt, fetchUserPrompt, fetchOrgGlossary, fetchUserOrgContext } = require('./appSettings');
 
 const MAX_TOOL_ROUNDS = 8;
 
@@ -112,11 +112,13 @@ async function callLlmStreaming({ apiUrl, apiKey, model, messages, tools, temper
  * Pass onToken(text) to stream final-answer tokens as they arrive.
  */
 async function runAnalysis({ question, email, datasetId, conversationHistory, mcpClient, mcpTools, signal, onToken }) {
-  const [model, temperature, customSystemPrompt, userPrompt] = await Promise.all([
+  const [model, temperature, customSystemPrompt, userPrompt, userOrgContext, orgGlossary] = await Promise.all([
     fetchAnalyzeModel(),
     fetchMcpAnswersTemperature(),
     fetchMcpAnswersSystemPrompt(),
     fetchUserPrompt(email),
+    fetchUserOrgContext(email),
+    fetchOrgGlossary(),
   ]);
   const apiUrl = process.env.AI_ANALYZE_API_URL || 'https://api.fuelix.ai/v1';
   const apiKey = process.env.OPENROUTER_API_KEY || '';
@@ -185,6 +187,9 @@ async function runAnalysis({ question, email, datasetId, conversationHistory, mc
     ? `\n\n## Pre-loaded context\n\n### Accessible datasets\n${prefetchedTableList}${prefetchedSchema ? `\n\n### Schema for selected dataset\n${prefetchedSchema}` : ''}`
     : '';
 
+  const orgContextParts = [userOrgContext, orgGlossary?.text].filter(Boolean);
+  const orgSection = orgContextParts.length > 0 ? '\n\n' + orgContextParts.join('\n\n') : '';
+
   const defaultSystemPrompt = `You are a data analyst with access to tools to explore and query a PostgreSQL database.
 The user you are serving has email: ${email}.
 Today's date is ${today}. Use this when the user refers to relative dates such as "current month", "last week", "this year", etc.
@@ -206,14 +211,14 @@ ${requiredProcess}
 ## Confidence check before answering
 Before writing your final response, ask yourself: "Did I execute a query whose results directly and completely answer this question?" If yes, answer confidently. If no, either ask a clarifying question or state the limitation.
 
-When you have a final answer or a clarifying question, respond in Markdown without calling any more tools. Use **bold** for key figures, bullet lists or numbered lists for multiple items, and tables for tabular data.${prefetchSection}`;
+When you have a final answer or a clarifying question, respond in Markdown without calling any more tools. Use **bold** for key figures, bullet lists or numbered lists for multiple items, and tables for tabular data.${orgSection}${prefetchSection}`;
 
   const userPromptSection = userPrompt
     ? `\n\n## Personal context from the user\n${userPrompt}`
     : '';
 
   const systemPrompt = customSystemPrompt
-    ? `${customSystemPrompt}\n\nThe user you are serving has email: ${email}.\nToday's date is ${today}. Use this when the user refers to relative dates such as "current month", "last week", "this year", etc.\n${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}${userPromptSection}${prefetchSection}`
+    ? `${customSystemPrompt}\n\nThe user you are serving has email: ${email}.\nToday's date is ${today}. Use this when the user refers to relative dates such as "current month", "last week", "this year", etc.\n${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}${userPromptSection}${orgSection}${prefetchSection}`
     : `${defaultSystemPrompt}${userPromptSection}`;
 
   const priorMessages = Array.isArray(conversationHistory) ? conversationHistory : [];
