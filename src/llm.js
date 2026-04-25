@@ -34,10 +34,85 @@ function extractViewsFromSql(sql) {
 }
 
 /**
+ * Makes a single streaming LLM call. Calls onToken(text) for each content token.
+ * Returns the reconstructed assistant message { role, content, tool_calls }.
+ */
+async function callLlmStreaming({ apiUrl, apiKey, model, messages, tools, temperature, signal, onToken }) {
+  const response = await axios.post(
+    `${apiUrl}/chat/completions`,
+    { model, messages, tools, tool_choice: 'auto', temperature, stream: true },
+    {
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      timeout: 60000,
+      signal,
+      responseType: 'stream',
+    }
+  );
+
+  let sseBuffer = '';
+  let content = '';
+  const toolCallsMap = {};
+  let hasToolCalls = false;
+
+  for await (const chunk of response.data) {
+    sseBuffer += chunk.toString('utf8');
+    const lines = sseBuffer.split('\n');
+    sseBuffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data: ')) continue;
+      const raw = trimmed.slice(6);
+      if (raw === '[DONE]') continue;
+
+      let parsed;
+      try { parsed = JSON.parse(raw); } catch { continue; }
+
+      const delta = parsed.choices?.[0]?.delta;
+      if (!delta) continue;
+
+      if (delta.tool_calls) {
+        hasToolCalls = true;
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index ?? 0;
+          if (!toolCallsMap[idx]) toolCallsMap[idx] = { id: '', name: '', arguments: '' };
+          if (tc.id) toolCallsMap[idx].id = tc.id;
+          if (tc.function?.name) toolCallsMap[idx].name += tc.function.name;
+          if (tc.function?.arguments) toolCallsMap[idx].arguments += tc.function.arguments;
+        }
+      }
+
+      if (delta.content) {
+        content += delta.content;
+        if (!hasToolCalls) onToken?.(delta.content);
+      }
+    }
+  }
+
+  const toolCallsList = hasToolCalls
+    ? Object.keys(toolCallsMap)
+        .sort((a, b) => Number(a) - Number(b))
+        .map(idx => ({
+          id: toolCallsMap[idx].id,
+          type: 'function',
+          function: { name: toolCallsMap[idx].name, arguments: toolCallsMap[idx].arguments },
+        }))
+    : null;
+
+  return {
+    role: 'assistant',
+    // Discard any content leaked before tool_calls — APIs reject assistant messages with both
+    content: hasToolCalls ? null : (content || null),
+    tool_calls: toolCallsList,
+  };
+}
+
+/**
  * Runs the LLM tool-use loop using the MCP client session.
  * Returns { answer, sql, rows, columns, model, queriedDatasets } where sql/rows/columns may be null.
+ * Pass onToken(text) to stream final-answer tokens as they arrive.
  */
-async function runAnalysis({ question, email, datasetId, conversationHistory, mcpClient, mcpTools, signal }) {
+async function runAnalysis({ question, email, datasetId, conversationHistory, mcpClient, mcpTools, signal, onToken }) {
   const [model, temperature, customSystemPrompt, userPrompt] = await Promise.all([
     fetchAnalyzeModel(),
     fetchMcpAnswersTemperature(),
@@ -66,7 +141,9 @@ async function runAnalysis({ question, email, datasetId, conversationHistory, mc
   let prefetchedSchema = null;
 
   try {
+    const t0 = Date.now();
     const listResult = await mcpClient.callTool({ name: 'list_tables', arguments: { email } });
+    console.log(`[timing] prefetch list_tables: ${Date.now() - t0}ms`);
     prefetchedTableList = listResult.content?.[0]?.text || null;
     if (prefetchedTableList) {
       viewToDataset = parseListTablesResult(prefetchedTableList);
@@ -75,7 +152,9 @@ async function runAnalysis({ question, email, datasetId, conversationHistory, mc
     if (datasetId && prefetchedTableList) {
       const matchingEntry = Object.entries(viewToDataset).find(([, v]) => v.datasetId === datasetId);
       if (matchingEntry) {
+        const t1 = Date.now();
         const schemaResult = await mcpClient.callTool({ name: 'describe_table', arguments: { email, view_name: matchingEntry[0] } });
+        console.log(`[timing] prefetch describe_table: ${Date.now() - t1}ms`);
         prefetchedSchema = schemaResult.content?.[0]?.text || null;
       }
     }
@@ -152,30 +231,29 @@ When you have a final answer or a clarifying question, respond in Markdown witho
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     if (signal?.aborted) throw new Error('Cancelled');
-    const response = await axios.post(
-      `${apiUrl}/chat/completions`,
-      {
-        model,
-        messages,
-        tools,
-        tool_choice: 'auto',
-        temperature,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 60000,
-        signal,
-      }
-    );
+    const tLlm = Date.now();
 
-    const choice = response.data.choices[0];
-    const assistantMsg = choice.message;
+    let assistantMsg;
+    if (onToken) {
+      assistantMsg = await callLlmStreaming({ apiUrl, apiKey, model, messages, tools, temperature, signal, onToken });
+    } else {
+      const response = await axios.post(
+        `${apiUrl}/chat/completions`,
+        { model, messages, tools, tool_choice: 'auto', temperature },
+        {
+          headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          timeout: 60000,
+          signal,
+        }
+      );
+      assistantMsg = response.data.choices[0].message;
+    }
+    console.log(`[timing] round ${round} LLM call${onToken ? ' (streaming)' : ''}: ${Date.now() - tLlm}ms`);
+
     messages.push(assistantMsg);
 
     if (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0) {
+      console.log(`[timing] round ${round} → final answer (no tool calls)`);
       // Final answer
       const queriedDatasets = lastSql
         ? extractViewsFromSql(lastSql).map(v => viewToDataset[v]).filter(Boolean)
@@ -192,6 +270,8 @@ When you have a final answer or a clarifying question, respond in Markdown witho
 
     // Execute all tool calls in parallel (preserves order for message insertion)
     if (signal?.aborted) throw new Error('Cancelled');
+    console.log(`[timing] round ${round} tool calls: [${assistantMsg.tool_calls.map(t => t.function.name).join(', ')}]`);
+    const tTools = Date.now();
     const toolMessages = await Promise.all(
       assistantMsg.tool_calls.map(async (toolCall) => {
         const toolName = toolCall.function.name;
@@ -207,9 +287,15 @@ When you have a final answer or a clarifying question, respond in Markdown witho
 
         let toolResult;
         try {
-          const mcpResult = await mcpClient.callTool({ name: toolName, arguments: toolArgs });
-          const content = mcpResult.content?.[0];
-          toolResult = content?.text || JSON.stringify(mcpResult);
+          // Return cached prefetch result to avoid duplicate MCP calls and context bloat
+          if (toolName === 'list_tables' && prefetchedTableList) {
+            console.log(`[timing] round ${round} list_tables served from cache`);
+            toolResult = prefetchedTableList;
+          } else {
+            const mcpResult = await mcpClient.callTool({ name: toolName, arguments: toolArgs });
+            const content = mcpResult.content?.[0];
+            toolResult = content?.text || JSON.stringify(mcpResult);
+          }
 
           // Build view→dataset map from list_tables result (plain text)
           if (toolName === 'list_tables') {
@@ -240,29 +326,34 @@ When you have a final answer or a clarifying question, respond in Markdown witho
       })
     );
 
+    console.log(`[timing] round ${round} all tools done: ${Date.now() - tTools}ms`);
     messages.push(...toolMessages);
   }
 
   // Exhausted rounds — ask for a final answer without tools
   if (signal?.aborted) throw new Error('Cancelled');
   messages.push({ role: 'user', content: 'Please summarize what you found so far.' });
-  const finalResp = await axios.post(
-    `${apiUrl}/chat/completions`,
-    { model, messages, temperature },
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: 30000,
-      signal,
-    }
-  );
+  let finalContent;
+  if (onToken) {
+    const finalMsg = await callLlmStreaming({ apiUrl, apiKey, model, messages, tools: [], temperature, signal, onToken });
+    finalContent = finalMsg.content || '';
+  } else {
+    const finalResp = await axios.post(
+      `${apiUrl}/chat/completions`,
+      { model, messages, temperature },
+      {
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        timeout: 30000,
+        signal,
+      }
+    );
+    finalContent = finalResp.data.choices[0].message.content || '';
+  }
   const queriedDatasets = lastSql
     ? extractViewsFromSql(lastSql).map(v => viewToDataset[v]).filter(Boolean)
     : [];
   return {
-    answer: finalResp.data.choices[0].message.content || '',
+    answer: finalContent,
     sql: lastSql,
     rows: lastRows,
     columns: lastColumns,
