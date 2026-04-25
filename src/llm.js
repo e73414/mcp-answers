@@ -59,16 +59,60 @@ async function runAnalysis({ question, email, datasetId, conversationHistory, mc
 
   const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 
+  // ── Pre-fetch dataset list (and schema when a dataset is selected) ──────────
+  // This eliminates 1-2 LLM round trips by injecting the data into the system prompt.
+  let viewToDataset = {};
+  let prefetchedTableList = null;
+  let prefetchedSchema = null;
+
+  try {
+    const listResult = await mcpClient.callTool({ name: 'list_tables', arguments: { email } });
+    prefetchedTableList = listResult.content?.[0]?.text || null;
+    if (prefetchedTableList) {
+      viewToDataset = parseListTablesResult(prefetchedTableList);
+    }
+
+    if (datasetId && prefetchedTableList) {
+      const matchingEntry = Object.entries(viewToDataset).find(([, v]) => v.datasetId === datasetId);
+      if (matchingEntry) {
+        const schemaResult = await mcpClient.callTool({ name: 'describe_table', arguments: { email, view_name: matchingEntry[0] } });
+        prefetchedSchema = schemaResult.content?.[0]?.text || null;
+      }
+    }
+  } catch (err) {
+    console.warn('Pre-fetch failed, LLM will call tools directly:', err.message);
+    prefetchedTableList = null;
+    prefetchedSchema = null;
+  }
+
+  // ── Build system prompt ───────────────────────────────────────────────────
+  const requiredProcess = prefetchedSchema
+    ? `## Required process
+1. The dataset list and schema are pre-loaded below — do NOT call list_tables or describe_table for the selected dataset.
+2. Write and execute precise SQL using the pre-loaded schema.
+3. Base your answer SOLELY on the rows returned by your queries.`
+    : prefetchedTableList
+    ? `## Required process
+1. The dataset list is pre-loaded below — do NOT call list_tables.
+2. Call describe_table on any view that might be relevant.
+3. Only after understanding the schema, write and execute precise SQL.
+4. Base your answer SOLELY on the rows returned by your queries.`
+    : `## Required process
+1. Call list_tables to discover available tables.
+2. Call describe_table on any table that might be relevant.
+3. Only after understanding the schema, write and execute precise SQL.
+4. Base your answer SOLELY on the rows returned by your queries.`;
+
+  const prefetchSection = prefetchedTableList
+    ? `\n\n## Pre-loaded context\n\n### Accessible datasets\n${prefetchedTableList}${prefetchedSchema ? `\n\n### Schema for selected dataset\n${prefetchedSchema}` : ''}`
+    : '';
+
   const defaultSystemPrompt = `You are a data analyst with access to tools to explore and query a PostgreSQL database.
 The user you are serving has email: ${email}.
 Today's date is ${today}. Use this when the user refers to relative dates such as "current month", "last week", "this year", etc.
 ${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}
 
-## Required process
-1. Call list_tables to discover available tables.
-2. Call describe_table on any table that might be relevant.
-3. Only after understanding the schema, write and execute precise SQL.
-4. Base your answer SOLELY on the rows returned by your queries.
+${requiredProcess}
 
 ## Strict rules — never violate these
 - NEVER state a number, name, date, or fact that did not appear in an actual query result. If you did not run a query that directly returns a value, you do not know that value.
@@ -84,15 +128,14 @@ ${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all
 ## Confidence check before answering
 Before writing your final response, ask yourself: "Did I execute a query whose results directly and completely answer this question?" If yes, answer confidently. If no, either ask a clarifying question or state the limitation.
 
-When you have a final answer or a clarifying question, respond in Markdown without calling any more tools. Use **bold** for key figures, bullet lists or numbered lists for multiple items, and tables for tabular data.`;
+When you have a final answer or a clarifying question, respond in Markdown without calling any more tools. Use **bold** for key figures, bullet lists or numbered lists for multiple items, and tables for tabular data.${prefetchSection}`;
 
-  // Use admin-configured system prompt if set, otherwise fall back to built-in default
   const userPromptSection = userPrompt
     ? `\n\n## Personal context from the user\n${userPrompt}`
     : '';
 
   const systemPrompt = customSystemPrompt
-    ? `${customSystemPrompt}\n\nThe user you are serving has email: ${email}.\nToday's date is ${today}. Use this when the user refers to relative dates such as "current month", "last week", "this year", etc.\n${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}${userPromptSection}`
+    ? `${customSystemPrompt}\n\nThe user you are serving has email: ${email}.\nToday's date is ${today}. Use this when the user refers to relative dates such as "current month", "last week", "this year", etc.\n${datasetId ? `Focus on the dataset with id: ${datasetId}.` : 'Search across all datasets accessible to this user.'}${userPromptSection}${prefetchSection}`
     : `${defaultSystemPrompt}${userPromptSection}`;
 
   const priorMessages = Array.isArray(conversationHistory) ? conversationHistory : [];
@@ -106,7 +149,6 @@ When you have a final answer or a clarifying question, respond in Markdown witho
   let lastSql = null;
   let lastRows = null;
   let lastColumns = null;
-  let viewToDataset = {}; // populated when list_tables is called
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     if (signal?.aborted) throw new Error('Cancelled');
@@ -148,53 +190,57 @@ When you have a final answer or a clarifying question, respond in Markdown witho
       };
     }
 
-    // Process tool calls
-    for (const toolCall of assistantMsg.tool_calls) {
-      if (signal?.aborted) throw new Error('Cancelled');
-      const toolName = toolCall.function.name;
-      let toolArgs;
-      try {
-        toolArgs = JSON.parse(toolCall.function.arguments || '{}');
-      } catch {
-        toolArgs = {};
-      }
-
-      // Inject the requesting user's email into every tool call
-      toolArgs.email = email;
-
-      let toolResult;
-      try {
-        const mcpResult = await mcpClient.callTool({ name: toolName, arguments: toolArgs });
-        const content = mcpResult.content?.[0];
-        toolResult = content?.text || JSON.stringify(mcpResult);
-
-        // Build view→dataset map from list_tables result (plain text)
-        if (toolName === 'list_tables') {
-          viewToDataset = parseListTablesResult(toolResult);
+    // Execute all tool calls in parallel (preserves order for message insertion)
+    if (signal?.aborted) throw new Error('Cancelled');
+    const toolMessages = await Promise.all(
+      assistantMsg.tool_calls.map(async (toolCall) => {
+        const toolName = toolCall.function.name;
+        let toolArgs;
+        try {
+          toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+        } catch {
+          toolArgs = {};
         }
 
-        // Capture SQL from call args and parse rows from the plain-text result
-        if (toolName === 'execute_query') {
-          if (toolArgs.sql) lastSql = toolArgs.sql;
-          // Result format: "Query returned N row(s):\n[JSON array]"
-          const rowMatch = toolResult.match(/Query returned \d+ row\(s\):\n([\s\S]+)/);
-          if (rowMatch) {
-            try {
-              lastRows = JSON.parse(rowMatch[1]);
-              lastColumns = lastRows.length > 0 ? Object.keys(lastRows[0]) : [];
-            } catch { /* ignore parse errors */ }
+        // Inject the requesting user's email into every tool call
+        toolArgs.email = email;
+
+        let toolResult;
+        try {
+          const mcpResult = await mcpClient.callTool({ name: toolName, arguments: toolArgs });
+          const content = mcpResult.content?.[0];
+          toolResult = content?.text || JSON.stringify(mcpResult);
+
+          // Build view→dataset map from list_tables result (plain text)
+          if (toolName === 'list_tables') {
+            viewToDataset = parseListTablesResult(toolResult);
           }
-        }
-      } catch (err) {
-        toolResult = `Error calling ${toolName}: ${err.message}`;
-      }
 
-      messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: toolResult,
-      });
-    }
+          // Capture SQL from call args and parse rows from the plain-text result
+          if (toolName === 'execute_query') {
+            if (toolArgs.sql) lastSql = toolArgs.sql;
+            // Result format: "Query returned N row(s):\n[JSON array]"
+            const rowMatch = toolResult.match(/Query returned \d+ row\(s\):\n([\s\S]+)/);
+            if (rowMatch) {
+              try {
+                lastRows = JSON.parse(rowMatch[1]);
+                lastColumns = lastRows.length > 0 ? Object.keys(lastRows[0]) : [];
+              } catch { /* ignore parse errors */ }
+            }
+          }
+        } catch (err) {
+          toolResult = `Error calling ${toolName}: ${err.message}`;
+        }
+
+        return {
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: toolResult,
+        };
+      })
+    );
+
+    messages.push(...toolMessages);
   }
 
   // Exhausted rounds — ask for a final answer without tools

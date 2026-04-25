@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const { createMcpSession } = require('./src/mcpClient');
+const { createMcpSession, invalidateMcpSession } = require('./src/mcpClient');
 const { runAnalysis } = require('./src/llm');
 
 const app = express();
@@ -37,6 +37,7 @@ app.post('/query', async (req, res) => {
     mcpClient = session.client;
     mcpTools = session.tools;
   } catch (err) {
+    invalidateMcpSession();
     console.error('Failed to connect to mcp-postgres:', err.message);
     return res.status(503).json({ error: 'MCP Postgres service unavailable' });
   }
@@ -52,10 +53,12 @@ app.post('/query', async (req, res) => {
     if (abortController.signal.aborted || err.message === 'Cancelled' || err.code === 'ERR_CANCELED') {
       return res.status(499).json({ error: 'Request cancelled' });
     }
+    // Invalidate session on connection errors so next request reconnects
+    if (err.code === 'ECONNREFUSED' || err.code === 'ECONNRESET' || err.code === 'ENOTFOUND') {
+      invalidateMcpSession();
+    }
     console.error('LLM analysis error:', err.message);
     return res.status(500).json({ error: 'Analysis failed: ' + err.message });
-  } finally {
-    try { await mcpClient.close(); } catch {}
   }
   const durationSeconds = Math.round((Date.now() - startTime) / 1000);
 
